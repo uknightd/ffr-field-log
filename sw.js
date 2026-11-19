@@ -1,5 +1,5 @@
 // Keeps the app working with no signal: the app files are stored on the phone.
-const CACHE = "ffr-field-log-v1";
+const CACHE = "ffr-field-log-v2";
 const SHELL = ["./", "index.html", "app.js", "config.js", "manifest.webmanifest", "icons/icon-192.png",
   "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.79.0/dist/umd/supabase.js",
   "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"];

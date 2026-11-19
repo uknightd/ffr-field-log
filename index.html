@@ -124,6 +124,15 @@ button{font:inherit;cursor:pointer}
 .sig canvas{width:100%;height:150px;background:var(--surface2);border:1px dashed var(--muted);border-radius:8px;touch-action:none;display:block}
 .sig .hint{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
 .mat{display:grid;grid-template-columns:1fr 80px 40px;gap:6px;align-items:center}
+.matrow{display:grid;grid-template-columns:1fr 72px 40px;gap:6px;align-items:center;padding-bottom:8px;border-bottom:1px solid var(--line)}
+.matinfo{grid-column:1/-1;font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.matinfo:empty{display:none}
+.mattot{display:flex;justify-content:space-between;font-size:14px;font-variant-numeric:tabular-nums;padding-top:2px}
+.mlist{display:grid;gap:10px}
+.mrow{display:grid;grid-template-columns:1fr 1fr 40px;gap:8px;align-items:end;padding-bottom:10px;border-bottom:1px solid var(--line)}
+.mrow .mname{grid-column:1/-1}
+@media (min-width:600px){.mrow{grid-template-columns:1fr 100px 120px 40px}.mrow .mname{grid-column:auto}}
+table.bill input,table.bill select{width:100%;font:inherit;color:var(--fg);background:var(--surface2);border:1px solid var(--line);border-radius:6px}
 .note{font-size:13px;color:var(--muted)}
 .callout{border-left:4px solid var(--non);background:var(--non-soft);padding:10px 12px;border-radius:6px;font-size:13px}
 .callout.info{border-color:var(--accent);background:var(--accent-soft)}

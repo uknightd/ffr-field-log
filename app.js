@@ -51,7 +51,7 @@ const Store=(()=>{
 
 /* ---------- state ---------- */
 const S={
-  jobs:[],clients:[],team:[],
+  jobs:[],clients:[],team:[],materials:[],
   settings:{company:"FFR Comms",prefix:"FFR",nextNo:1,logo:null,logoW:0,logoH:0},
   me:{name:""},            // local mode: technician name on this phone
   user:null,profile:null,  // cloud mode: signed-in person
@@ -71,6 +71,7 @@ async function loadLocal(){
   else if(me&&me.value.company){/* settings from the first preview version */Object.assign(S.settings,{company:me.value.company,prefix:me.value.prefix||"FFR",nextNo:me.value.nextNo||1,logo:me.value.logo||null,logoW:me.value.logoW,logoH:me.value.logoH})}
   const prof=await Store.get("meta","profile");if(prof)S.profile=prof.value;
   const team=await Store.get("meta","team");if(team)S.team=team.value;
+  const mats=await Store.get("meta","materials");if(mats)S.materials=mats.value;
 }
 async function saveMe(){await Store.put("meta",{key:"me",value:S.me});renderWho()}
 async function saveSettingsLocal(){await Store.put("meta",{key:"settings",value:S.settings})}
@@ -93,7 +94,17 @@ async function seedExamples(){
   ];
   for(const x of j)await Store.put("jobs",x);
   S.jobs=j;
+  S.materials=[
+    {id:"m-ex1",example:true,name:"CAT6 cable",unit:"m",price:14.5},
+    {id:"m-ex2",example:true,name:"RJ45 keystone jack",unit:"each",price:38},
+    {id:"m-ex3",example:true,name:"Wall box (single)",unit:"each",price:65},
+    {id:"m-ex4",example:true,name:"Patch lead 1 m",unit:"each",price:45},
+    {id:"m-ex5",example:true,name:"Fibre patch lead LC-LC 2 m",unit:"each",price:180}
+  ];await saveMaterialsLocal();
+  for(const x of j)for(const m of x.materials){const pm=S.materials.find(p=>m.item.toLowerCase().startsWith(p.name.toLowerCase().slice(0,8)));if(pm){m.materialId=pm.id;m.unit=pm.unit;m.price=pm.price}}
+  for(const x of j)await Store.put("jobs",x);
 }
+async function saveMaterialsLocal(){await Store.put("meta",{key:"materials",value:S.materials})}
 
 /* ---------- mapping between the phone and the database ---------- */
 const jobToRow=j=>({id:j.id,no:isTempNo(j.no)?null:j.no,client_id:j.clientId||null,site:j.site,date:j.date,time_in:j.timeIn,time_out:j.timeOut,type:j.type,reasons:j.reasons,reason_note:j.reasonNote,fault:j.fault,findings:j.findings,work:j.work,materials:j.materials,tech_id:j.techId,tech_name:j.techName,tech_sig:j.techSig,client_name:j.clientName,client_sig:j.clientSig,ack:j.ack,status:j.status,invoiced:j.invoiced,signed_at:j.signedAt?new Date(j.signedAt).toISOString():null,updated_at:new Date().toISOString()});
@@ -156,6 +167,8 @@ async function syncNow(){
     await Store.clear("clients");for(const c of S.clients)await Store.put("clients",c);
     if(st.data){Object.assign(S.settings,{company:st.data.company,prefix:st.data.prefix,nextNo:st.data.next_no,logo:st.data.logo,logoW:st.data.logo_w,logoH:st.data.logo_h});await saveSettingsLocal()}
     S.team=pr.data;await Store.put("meta",{key:"team",value:S.team});
+    const mt=await sb.from("materials").select("*").order("name");
+    if(!mt.error){S.materials=mt.data.map(m=>({id:m.id,name:m.name,unit:m.unit,price:+m.price,active:m.active})).filter(m=>m.active!==false);await saveMaterialsLocal()}
     const me=pr.data.find(p=>p.id===S.user.id);if(me){S.profile=me;await Store.put("meta",{key:"profile",value:me})}
     const byJob={};for(const p of ph.data)(byJob[p.job_id]=byJob[p.job_id]||[]).push(rowToPhoto(p));
     const local=new Map(S.jobs.map(j=>[j.id,j]));const seen=new Set();
@@ -207,7 +220,11 @@ function needOnline(){if(!CLOUD)return false;if(!navigator.onLine){toast("You're
 
 function newJob(){return{id:uuid(),no:"",clientId:"",site:"",date:today(),timeIn:nowTime(),timeOut:"",type:"",reasons:[],reasonNote:"",fault:"",findings:"",work:"",materials:[],photos:[],techId:S.user?.id||null,techName:myName(),techSig:"",clientName:"",clientSig:"",ack:false,status:"draft",invoiced:false,created:Date.now(),dirty:true}}
 function jobHours(j){return hoursBetween(j.timeIn,j.timeOut)}
-function jobAmount(j){const c=client(j.clientId)||{};return (+c.callout||0)+jobHours(j)*(+c.rate||0)}
+const lineTotal=m=>(parseFloat(String(m.qty).replace(",","."))||0)*(+m.price||0);
+const matTotal=j=>j.materials.filter(m=>m.item).reduce((s,m)=>s+lineTotal(m),0);
+const labour=j=>{const c=client(j.clientId)||{};return jobHours(j)*(+c.rate||0)};
+function jobAmount(j){const c=client(j.clientId)||{};return (+c.callout||0)+labour(j)+matTotal(j)}
+const matByName=n=>{n=String(n||"").trim().toLowerCase();return S.materials.find(m=>m.name.toLowerCase()===n)};
 
 /* ---------- downloads (works inside Claude and as a normal web app) ---------- */
 let dlCap; const dlReady=(async()=>{try{dlCap=(window.claude&&window.claude.use)?await window.claude.use("downloads"):null}catch(e){dlCap=null}})();
@@ -226,8 +243,8 @@ function render(){
   if(CLOUD&&!S.user){nav.hidden=true;return vLogin()}
   if(CLOUD&&!S.profile?.active){nav.hidden=true;return vWaiting()}
   nav.hidden=false;
-  document.querySelectorAll("nav.tabs button").forEach(b=>b.setAttribute("aria-current",(b.dataset.go===S.view||(S.view==="edit"&&b.dataset.go==="new")||(S.view==="job"&&b.dataset.go==="jobs")||(S.view==="client"&&b.dataset.go==="clients"))?"page":"false"));
-  ({jobs:vJobs,edit:vEdit,job:vJob,billing:vBilling,clients:vClients,client:vClient,settings:vSettings}[S.view]||vJobs)();
+  document.querySelectorAll("nav.tabs button").forEach(b=>b.setAttribute("aria-current",(b.dataset.go===S.view||(S.view==="edit"&&b.dataset.go==="new")||(S.view==="job"&&b.dataset.go==="jobs")||(["client","materials"].includes(S.view)&&b.dataset.go==="clients"))?"page":"false"));
+  ({jobs:vJobs,edit:vEdit,job:vJob,billing:vBilling,clients:vClients,client:vClient,settings:vSettings,materials:vMaterials}[S.view]||vJobs)();
   hydratePhotos(view);
 }
 
@@ -324,7 +341,7 @@ function vEdit(){
     <label class="f">What you found<textarea id="e-find">${esc(j.findings)}</textarea></label>
     <label class="f">Work done<textarea id="e-work">${esc(j.work)}</textarea></label>
   </section>
-  <section class="section"><h2>Materials used</h2><div id="mats" class="stack" style="gap:6px"></div><div><button class="btn small" id="add-mat" type="button">+ Add material</button></div></section>
+  <section class="section"><h2>Materials used</h2><p class="note" style="margin:0">Start typing to pick from the office price list.${S.materials.length?"":" The price list is empty, so ask the office to add materials."}</p><datalist id="matlist">${S.materials.map(m=>`<option value="${esc(m.name)}">${esc(m.unit)} · ${R(m.price)}</option>`).join("")}</datalist><div id="mats" class="stack" style="gap:6px"></div><div><button class="btn small" id="add-mat" type="button">+ Add material</button></div></section>
   <section class="section"><h2>Photos</h2>
     <p class="note" style="margin:0">Each photo is stamped with the client, date, time and GPS location.</p>
     <div class="addph">${Object.entries(STAGES).map(([k,l])=>`<label class="btn file-btn">${l} photo<input type="file" accept="image/*" capture="environment" data-stage="${k}" multiple></label>`).join("")}</div>
@@ -347,7 +364,7 @@ function vEdit(){
   view.querySelectorAll(".seg button").forEach(b=>b.onclick=()=>{j.type=b.dataset.v;autosave();view.querySelectorAll(".seg button").forEach(x=>x.setAttribute("aria-pressed",x===b));$("nonsla-box").hidden=j.type!=="nonsla";$("ack-wrap").hidden=j.type!=="nonsla"});
   view.querySelectorAll("[data-r]").forEach(cb=>cb.onchange=()=>{j.reasons=[...view.querySelectorAll("[data-r]:checked")].map(x=>REASONS[+x.dataset.r]);autosave()});
   $("e-ack").onchange=e=>{j.ack=e.target.checked;autosave()};
-  renderMats();$("add-mat").onclick=()=>{j.materials.push({item:"",qty:""});renderMats();const ins=$("mats").querySelectorAll("input");ins[ins.length-2]?.focus()};
+  renderMats();$("add-mat").onclick=()=>{j.materials.push({item:"",qty:"1",price:0});renderMats();const ins=$("mats").querySelectorAll("input[data-k=item]");ins[ins.length-1]?.focus()};
   renderPhotos();
   view.querySelectorAll("input[type=file]").forEach(inp=>inp.onchange=async()=>{const files=[...inp.files];inp.value="";for(const f of files){await addPhoto(f,inp.dataset.stage)}});
   initSig("tech",v=>{j.techSig=v;autosave()});initSig("client",v=>{j.clientSig=v;autosave()});
@@ -368,9 +385,24 @@ async function deleteJob(){
   await Store.del("jobs",j.id);S.jobs=S.jobs.filter(x=>x.id!==j.id);toast("Job deleted");go("jobs");
 }
 function renderMats(){const j=S.editing;const box=document.getElementById("mats");
-  box.innerHTML=j.materials.length?j.materials.map((m,i)=>`<div class="mat"><input type="text" data-mi="${i}" data-k="item" value="${esc(m.item)}" placeholder="Item, e.g. CAT6 cable (m)" aria-label="Material"><input type="text" inputmode="decimal" data-mi="${i}" data-k="qty" value="${esc(m.qty)}" placeholder="Qty" aria-label="Quantity"><button class="btn small ghost" data-rm="${i}" aria-label="Remove">✕</button></div>`).join(""):`<p class="note" style="margin:0">No materials added.</p>`;
-  box.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{j.materials[+inp.dataset.mi][inp.dataset.k]=inp.value;autosave()});
+  const row=(m,i)=>`<div class="matrow"><input type="text" list="matlist" data-mi="${i}" data-k="item" value="${esc(m.item)}" placeholder="Material, e.g. CAT6 cable" aria-label="Material" autocomplete="off">
+    <input type="text" inputmode="decimal" data-mi="${i}" data-k="qty" value="${esc(m.qty)}" placeholder="Qty" aria-label="Quantity">
+    <button class="btn small ghost" data-rm="${i}" aria-label="Remove">✕</button>
+    <div class="matinfo" data-info="${i}">${matInfo(m)}</div></div>`;
+  box.innerHTML=j.materials.length?j.materials.map(row).join("")+`<div class="mattot">Materials total <b data-mt>${R(matTotal(j))}</b></div>`:`<p class="note" style="margin:0">No materials added.</p>`;
+  box.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{const m=j.materials[+inp.dataset.mi];m[inp.dataset.k]=inp.value;
+    if(inp.dataset.k==="item"){const pm=matByName(inp.value);if(pm){m.materialId=pm.id;m.unit=pm.unit;m.price=pm.price}else{delete m.materialId;if(!isAdmin()){m.price=0;m.unit=""}}}
+    const info=box.querySelector(`[data-info="${inp.dataset.mi}"]`);if(info)info.innerHTML=matInfo(m);bindPrice();const t=box.querySelector("[data-mt]");if(t)t.textContent=R(matTotal(j));autosave()});
+  const bindPrice=()=>box.querySelectorAll("[data-price]").forEach(inp=>inp.oninput=()=>{const m=j.materials[+inp.dataset.price];m.price=parseFloat(inp.value.replace(",","."))||0;const lt=box.querySelector(`[data-lt="${inp.dataset.price}"]`);if(lt)lt.textContent=R(lineTotal(m));const t=box.querySelector("[data-mt]");if(t)t.textContent=R(matTotal(j));autosave()});
+  bindPrice();
   box.querySelectorAll("[data-rm]").forEach(b=>b.onclick=()=>{j.materials.splice(+b.dataset.rm,1);renderMats();autosave()});
+}
+function matInfo(m){
+  const i=S.editing.materials.indexOf(m);
+  if(!m.item)return"";
+  if(m.materialId)return`${esc(m.unit||"each")} @ ${R(m.price)} = <b data-lt="${i}">${R(lineTotal(m))}</b>`;
+  if(isAdmin())return`Not on the price list. Price each: <input type="text" inputmode="decimal" data-price="${i}" value="${m.price||""}" placeholder="0.00" aria-label="Price each" style="width:90px;min-height:32px;padding:4px 8px"> = <b data-lt="${i}">${R(lineTotal(m))}</b>`;
+  return`Not on the price list. The office will add the price.`;
 }
 function renderPhotos(){const j=S.editing;const box=document.getElementById("photos");if(!box)return;
   box.innerHTML=j.photos.map((p,i)=>`<div class="ph">${photoImg(p,STAGES[p.stage]+" photo")}<div class="cap"><b>${STAGES[p.stage]}</b> · ${new Date(p.ts).toLocaleTimeString("en-ZA",{hour:"2-digit",minute:"2-digit"})}${p.lat?" · GPS":""}</div><button class="x" data-px="${i}" aria-label="Remove photo">×</button></div>`).join("")||`<p class="note" style="margin:0;grid-column:1/-1">No photos yet. Take a before photo when you arrive.</p>`;
@@ -436,10 +468,10 @@ function vJob(){
   <section class="section"><dl class="kv">
    <dt>Client</dt><dd>${esc(c.name||"—")}</dd><dt>Site</dt><dd>${esc([c.site,j.site].filter(Boolean).join(" · ")||"—")}</dd>
    <dt>SLA</dt><dd>${esc(c.sla||"—")}</dd><dt>Date</dt><dd>${fmtDate(j.date)}, ${esc(j.timeIn)}–${esc(j.timeOut||"…")} (${jobHours(j)} h)</dd>
-   <dt>Technician</dt><dd>${esc(j.techName||"—")}</dd>${j.type==="nonsla"?`<dt>Estimated charge</dt><dd>${R(jobAmount(j))} <span class="note">(call-out + ${jobHours(j)} h labour, excl. materials)</span></dd>`:""}
+   <dt>Technician</dt><dd>${esc(j.techName||"—")}</dd>${j.type==="nonsla"?`<dt>Estimated charge</dt><dd>${R(jobAmount(j))} <span class="note">(call-out + ${jobHours(j)} h labour + materials, excl. VAT)</span></dd>`:""}
   </dl></section>
   ${j.type==="nonsla"?`<section class="section"><h2>Why this is not covered by the SLA</h2><div class="chips">${j.reasons.map(r=>`<span class="pill nonsla" style="text-transform:none;letter-spacing:0;font-size:13px">${esc(r)}</span>`).join("")}</div>${j.reasonNote?`<p style="margin:0">${esc(j.reasonNote)}</p>`:""}<p class="note" style="margin:0">${j.ack?"Client agreed on site that this work is chargeable.":"Client has not acknowledged the charge."}</p></section>`:""}
-  <section class="section"><h2>Work</h2><dl class="kv"><dt>Reported</dt><dd>${esc(j.fault||"—")}</dd><dt>Found</dt><dd>${esc(j.findings||"—")}</dd><dt>Done</dt><dd>${esc(j.work||"—")}</dd><dt>Materials</dt><dd>${j.materials.filter(m=>m.item).map(m=>esc(m.qty?m.qty+" × "+m.item:m.item)).join("<br>")||"—"}</dd></dl></section>
+  <section class="section"><h2>Work</h2><dl class="kv"><dt>Reported</dt><dd>${esc(j.fault||"—")}</dd><dt>Found</dt><dd>${esc(j.findings||"—")}</dd><dt>Done</dt><dd>${esc(j.work||"—")}</dd><dt>Materials</dt><dd>${j.materials.filter(m=>m.item).map(m=>esc((m.qty?m.qty+" × ":"")+m.item)+(m.price?` <span class="note">@ ${R(m.price)} = ${R(lineTotal(m))}</span>`:"")).join("<br>")||"—"}${matTotal(j)?`<br><b>Total ${R(matTotal(j))}</b>`:""}</dd></dl></section>
   <section class="section"><h2>Photos (${j.photos.length})</h2><div class="photos">${j.photos.map(p=>`<div class="ph">${photoImg(p,STAGES[p.stage]+" photo")}<div class="cap"><b>${STAGES[p.stage]}</b> · ${new Date(p.ts).toLocaleString("en-ZA",{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"})}</div></div>`).join("")||'<p class="note" style="margin:0">No photos.</p>'}</div></section>
   <section class="section"><h2>Signatures</h2><div class="row"><div><div class="note">Technician: ${esc(j.techName||"—")}</div>${j.techSig?`<img src="${j.techSig}" alt="Technician signature" style="max-height:80px;background:#fff;border-radius:6px">`:'<p class="note">Not signed</p>'}</div><div><div class="note">Client: ${esc(j.clientName||"—")}</div>${j.clientSig?`<img src="${j.clientSig}" alt="Client signature" style="max-height:80px;background:#fff;border-radius:6px">`:'<p class="note">Not signed</p>'}</div></div></section>
   <div class="actions"><button class="btn primary" id="pdf">Download job report (PDF)</button>${canEditJob(j)?'<button class="btn" id="edit">Edit job</button>':""}</div>
@@ -479,8 +511,12 @@ async function jobPDF(j){
   if(j.type==="nonsla"){head("Reason work is not covered by the SLA");kv([["Cause",j.reasons.join("; ")],["Details",j.reasonNote],...(c.excludes?[["SLA exclusions",c.excludes]]:[])]);}
   head("Work carried out");kv([["Fault reported",j.fault],["Findings",j.findings],["Work done",j.work]]);
   const mats=j.materials.filter(m=>m.item);
-  if(mats.length){head("Materials used");doc.setFontSize(9.5);doc.setFont("helvetica","normal");mats.forEach(m=>{ensure(6);doc.setTextColor(...col.ink);doc.text(m.item,M,y);doc.text(String(m.qty||""),W-M,y,{align:"right"});y+=5})}
-  if(j.type==="nonsla"){head("Charges (estimate)");kv([["Call-out fee",R(c.callout)],["Labour",`${jobHours(j)} h × ${R(c.rate)}/h = ${R(jobHours(j)*(+c.rate||0))}`],["Total (excl. VAT)",R(jobAmount(j))+" plus materials"]])}
+  if(mats.length){head("Materials used");const priced=j.type==="nonsla";doc.setFontSize(9.5);
+    const hdr=()=>{doc.setFont("helvetica","bold");doc.setTextColor(...col.muted);doc.text("Item",M,y);doc.text("Qty",priced?W-M-68:W-M,y,{align:"right"});if(priced){doc.text("Unit price",W-M-30,y,{align:"right"});doc.text("Amount",W-M,y,{align:"right"})}y+=5;doc.setFont("helvetica","normal")};hdr();
+    mats.forEach(m=>{const nm=doc.splitTextToSize(m.item,priced?W-2*M-80:W-2*M-30);ensure(nm.length*4.6+2);doc.setTextColor(...col.ink);doc.text(nm,M,y);doc.text(`${m.qty||""}${m.unit&&m.unit!=="each"?" "+m.unit:""}`,priced?W-M-68:W-M,y,{align:"right"});
+      if(priced){doc.text(m.price?R(m.price):"—",W-M-30,y,{align:"right"});doc.text(R(lineTotal(m)),W-M,y,{align:"right"})}y+=nm.length*4.6+0.8});
+    if(priced){ensure(7);doc.setDrawColor(...col.line);doc.line(W-M-70,y-2.5,W-M,y-2.5);doc.setFont("helvetica","bold");doc.text("Materials total",W-M-30,y+1.5,{align:"right"});doc.text(R(matTotal(j)),W-M,y+1.5,{align:"right"});doc.setFont("helvetica","normal");y+=7}}
+  if(j.type==="nonsla"){head("Charges (estimate)");kv([["Call-out fee",R(c.callout)],["Labour",`${jobHours(j)} h × ${R(c.rate)}/h = ${R(jobHours(j)*(+c.rate||0))}`],["Materials",R(matTotal(j))],["Total (excl. VAT)",R(jobAmount(j))]])}
   if(photos.length){head(`Photos (${photos.length})`);const gw=(W-2*M-6)/2;let cx=0,lastH=60;
     for(const st of["before","during","after"]){for(const p of photos.filter(p=>p.stage===st)){const h=Math.min(gw*((p.h||3)/(p.w||4)),70);if(cx===0)ensure(h+10);const x=M+cx*(gw+6);
       try{doc.addImage(p.data,"JPEG",x,y,gw,h)}catch(e){}
@@ -499,7 +535,7 @@ async function jobPDF(j){
 function vBilling(){
   const m=S.billMonth;const list=S.jobs.filter(j=>j.type==="nonsla"&&j.date.startsWith(m)).sort((a,b)=>a.date.localeCompare(b.date));
   const tot=list.reduce((s,j)=>s+jobAmount(j),0),open=list.filter(j=>!j.invoiced);
-  view.innerHTML=`<h1>Billing</h1><p class="lead">Non-SLA work to invoice. Amounts are call-out plus labour at each client's rate, before materials and VAT.</p>
+  view.innerHTML=`<h1>Billing</h1><p class="lead">Non-SLA work to invoice. Amounts are call-out, labour at each client's rate and materials from the price list, before VAT.</p>
   <div class="toolbar"><label class="f" style="flex:0 1 200px">Month<input type="month" id="bm" value="${m}" style="width:100%;font:inherit;color:var(--fg);background:var(--surface2);border:1px solid var(--line);border-radius:8px;padding:10px 11px;min-height:44px"></label></div>
   <div class="stats"><div class="stat non"><b>${list.length}</b><span>Non-SLA jobs</span></div><div class="stat"><b>${open.length}</b><span>Not invoiced</span></div><div class="stat"><b style="font-size:17px">${R(tot)}</b><span>Est. value</span></div></div>
   ${list.length?`<div class="section"><div class="tblwrap"><table class="bill"><thead><tr><th>Job</th><th>Client / cause</th><th class="n">Hours</th><th class="n">Est.</th><th>Billed</th></tr></thead><tbody>${list.map(j=>`<tr><td><a href="#" data-open="${j.id}" class="mono">${esc(isTempNo(j.no)?"New":j.no)}</a><br><span class="note">${fmtDate(j.date)}</span></td><td>${esc(client(j.clientId)?.name||"—")}<br><span class="note">${esc(j.reasons.join("; "))}</span></td><td class="n">${jobHours(j)}</td><td class="n">${R(jobAmount(j))}</td><td><input type="checkbox" data-inv="${j.id}" ${j.invoiced?"checked":""} ${isAdmin()?"":"disabled"} aria-label="Invoiced"></td></tr>`).join("")}</tbody></table></div></div>
@@ -507,7 +543,7 @@ function vBilling(){
   document.getElementById("bm").onchange=e=>{S.billMonth=e.target.value||today().slice(0,7);vBilling()};
   view.querySelectorAll("[data-open]").forEach(a=>a.onclick=e=>{e.preventDefault();go("job",a.dataset.open)});
   view.querySelectorAll("[data-inv]").forEach(cb=>cb.onchange=async()=>{const j=S.jobs.find(x=>x.id===cb.dataset.inv);j.invoiced=cb.checked;await persist(j);syncNow();vBilling()});
-  const bc=document.getElementById("bcsv");if(bc)bc.onclick=()=>{const rows=[["Job no","Date","Client","Site","Technician","Cause","Details","Time in","Time out","Hours","Call-out","Rate","Estimated amount","Materials","Client acknowledged","Invoiced"]].concat(list.map(j=>{const c=client(j.clientId)||{};return[j.no,j.date,c.name,j.site,j.techName,j.reasons.join("; "),j.reasonNote,j.timeIn,j.timeOut,jobHours(j),c.callout||0,c.rate||0,jobAmount(j).toFixed(2),j.materials.filter(x=>x.item).map(x=>`${x.qty} x ${x.item}`).join("; "),j.ack?"Yes":"No",j.invoiced?"Yes":"No"]}));
+  const bc=document.getElementById("bcsv");if(bc)bc.onclick=()=>{const rows=[["Job no","Date","Client","Site","Technician","Cause","Details","Time in","Time out","Hours","Call-out","Rate","Labour","Materials amount","Estimated amount","Materials","Client acknowledged","Invoiced"]].concat(list.map(j=>{const c=client(j.clientId)||{};return[j.no,j.date,c.name,j.site,j.techName,j.reasons.join("; "),j.reasonNote,j.timeIn,j.timeOut,jobHours(j),c.callout||0,c.rate||0,labour(j).toFixed(2),matTotal(j).toFixed(2),jobAmount(j).toFixed(2),j.materials.filter(x=>x.item).map(x=>`${x.qty} x ${x.item}`).join("; "),j.ack?"Yes":"No",j.invoiced?"Yes":"No"]}));
     saveFile(`Non-SLA jobs ${m}.csv`,new Blob(["﻿"+rows.map(r=>r.map(v=>`"${String(v??"").replace(/"/g,'""')}"`).join(",")).join("\r\n")],{type:"text/csv"}))};
   const bp=document.getElementById("bpdf");if(bp)bp.onclick=()=>{const JS=pdfLib();if(!JS)return;const doc=new JS({unit:"mm",format:"a4",orientation:"landscape"});const W=297,M=12;
     pdfHeader(doc,W,M,`Non-SLA work for ${new Date(m+"-01T00:00:00").toLocaleDateString("en-ZA",{month:"long",year:"numeric"})}`,"","");
@@ -522,9 +558,10 @@ function vBilling(){
 /* ---------- clients ---------- */
 function vClients(){
   view.innerHTML=`<h1>Clients</h1><p class="lead">What each SLA covers, and the rates used for chargeable work.${isAdmin()?"":" Only the office can add or change clients."}</p>
-  ${isAdmin()?'<div class="actions" style="margin-bottom:12px"><button class="btn primary" id="nc">+ Add client</button></div>':""}
+  <div class="actions" style="margin-bottom:12px">${isAdmin()?'<button class="btn primary" id="nc">+ Add client</button>':""}<button class="btn" id="go-mats">Materials price list (${S.materials.length})</button></div>
   <div class="jobs">${S.clients.slice().sort((a,b)=>a.name.localeCompare(b.name)).map(c=>{const n=S.jobs.filter(j=>j.clientId===c.id).length;return`<button class="job" data-id="${c.id}" data-t="${/no sla/i.test(c.sla||"")||!c.sla?"maint":"sla"}"><span class="stripe"></span><span class="body"><span class="l1"><span class="client">${esc(c.name)}</span>${c.example?'<span class="pill ex">Example</span>':""}</span><span class="meta">${esc(c.sla||"No SLA on file")}</span><span class="meta">${n} job${n===1?"":"s"} · ${R(c.rate)}/h · call-out ${R(c.callout)}</span></span></button>`}).join("")||`<div class="empty">No clients yet.${isAdmin()?" Tap <b>Add client</b> to set up your first one.":""}</div>`}</div>`;
   const nc=document.getElementById("nc");if(nc)nc.onclick=()=>go("client","new");
+  document.getElementById("go-mats").onclick=()=>go("materials");
   view.querySelectorAll(".job").forEach(el=>el.onclick=()=>go("client",el.dataset.id));
 }
 function vClient(){
@@ -552,9 +589,47 @@ function vClient(){
     await Store.del("clients",c.id);S.clients=S.clients.filter(x=>x.id!==c.id);go("clients")}};
 }
 
+/* ---------- materials price list ---------- */
+function vMaterials(){
+  const ed=isAdmin();const list=S.materials.slice().sort((a,b)=>a.name.localeCompare(b.name));const q=(S.matQ||"").toLowerCase();
+  const shown=list.filter(m=>!q||m.name.toLowerCase().includes(q));
+  view.innerHTML=`<h1>Materials price list</h1><p class="lead">${ed?"Prices you set here fill in automatically when technicians add materials to a job. Changing a price doesn't change jobs already logged.":"Prices set by the office. Pick these when you add materials to a job."}</p>
+  ${ed?`<form class="section" id="mf" style="margin-bottom:14px"><h2>Add material</h2>
+    <label class="f">Material<input type="text" id="mf-name" placeholder="e.g. CAT6 cable" required></label>
+    <div class="row"><label class="f">Unit<select id="mf-unit">${["each","m","box","roll","pack","hour","set"].map(u=>`<option>${u}</option>`).join("")}</select></label><label class="f">Price (R, excl. VAT)<input type="number" step="0.01" inputmode="decimal" id="mf-price" placeholder="0.00" required></label></div>
+    <div class="actions"><button class="btn primary" type="submit">Add to price list</button></div></form>`:""}
+  ${list.length>8?`<div class="toolbar"><input type="search" id="mq" placeholder="Search materials…" value="${esc(S.matQ||"")}" aria-label="Search materials"></div>`:""}
+  ${shown.length?`<div class="section">${ed?`<div class="mlist">${shown.map(m=>`<div class="mrow" data-id="${m.id}">
+     <label class="f mname">Material${m.example?' <span class="pill ex">Example</span>':""}<input type="text" data-f="name" value="${esc(m.name)}"></label>
+     <label class="f">Unit<select data-f="unit">${[...new Set(["each","m","box","roll","pack","hour","set",m.unit])].map(u=>`<option ${u===m.unit?"selected":""}>${esc(u)}</option>`).join("")}</select></label>
+     <label class="f">Price (R)<input type="number" step="0.01" inputmode="decimal" data-f="price" value="${m.price}"></label>
+     <button class="btn small ghost" data-del="${m.id}" aria-label="Remove ${esc(m.name)}">✕</button></div>`).join("")}</div><p class="note" style="margin:0">Changes save when you leave a box.</p>`
+    :`<div class="tblwrap"><table class="bill"><thead><tr><th>Material</th><th>Unit</th><th class="n">Price</th></tr></thead><tbody>${shown.map(m=>`<tr><td>${esc(m.name)}</td><td>${esc(m.unit)}</td><td class="n">${R(m.price)}</td></tr>`).join("")}</tbody></table></div>`}</div>`:`<div class="empty">${list.length?"No materials match.":ed?"No materials yet. Add your first one above.":"The office hasn't added any materials yet."}</div>`}
+  <div class="actions" style="margin-top:12px"><button class="btn" id="m-back">Back to clients</button></div>`;
+  const $=id=>document.getElementById(id);
+  $("m-back").onclick=()=>go("clients");
+  if($("mq"))$("mq").oninput=e=>{S.matQ=e.target.value;const p=e.target.selectionStart;vMaterials();const n=$("mq");n.focus();n.setSelectionRange(p,p)};
+  if($("mf"))$("mf").onsubmit=async e=>{e.preventDefault();const m={id:uuid(),name:$("mf-name").value.trim(),unit:$("mf-unit").value,price:parseFloat($("mf-price").value)||0};
+    if(!m.name)return;if(matByName(m.name)){toast("That material is already on the list");return}
+    if(!await saveMaterial(m))return;S.materials.push(m);await saveMaterialsLocal();toast("Added "+m.name);vMaterials();$("mf-name").focus()};
+  view.querySelectorAll(".mrow [data-f]").forEach(inp=>inp.onchange=async()=>{const m=S.materials.find(x=>x.id===inp.closest(".mrow").dataset.id);const old={...m};
+    const f=inp.dataset.f;const v=f==="price"?(parseFloat(inp.value)||0):inp.value.trim();if(f==="name"&&!v){inp.value=m.name;return}
+    m[f]=v;if(f==="name")m.example=false;if(!await saveMaterial(m)){Object.assign(m,old);vMaterials();return}await saveMaterialsLocal();toast("Saved")});
+  view.querySelectorAll("[data-del]").forEach(b=>b.onclick=async()=>{const m=S.materials.find(x=>x.id===b.dataset.del);
+    if(!await confirmBox(`Remove ${m.name} from the price list? Jobs already logged keep their prices.`,"Remove"))return;
+    if(CLOUD&&!m.example){if(needOnline())return;const{error}=await sb.from("materials").delete().eq("id",m.id);if(error){toast("Couldn't remove: "+error.message);return}}
+    S.materials=S.materials.filter(x=>x.id!==m.id);await saveMaterialsLocal();vMaterials()});
+}
+async function saveMaterial(m){
+  if(!CLOUD)return true;if(needOnline())return false;
+  const{error}=await sb.from("materials").upsert({id:m.id,name:m.name,unit:m.unit,price:m.price,updated_at:new Date().toISOString()});
+  if(error){toast(/relation|does not exist|schema cache/i.test(error.message)?"The price list isn't switched on in the database yet. Try again shortly.":"Couldn't save: "+error.message);return false}
+  return true;
+}
+
 /* ---------- me / office settings ---------- */
 function vSettings(){
-  const st=S.settings;const ex=S.jobs.filter(j=>j.example).length+S.clients.filter(c=>c.example).length;
+  const st=S.settings;const ex=S.jobs.filter(j=>j.example).length+S.clients.filter(c=>c.example).length+S.materials.filter(m=>m.example).length;
   const pending=S.team.filter(p=>!p.active);
   view.innerHTML=`<h1>${CLOUD&&isAdmin()?"Me and office":"Me"}</h1><div class="stack">
   <section class="section"><h2>${CLOUD?"Signed in":"Technician"}</h2>
@@ -603,7 +678,7 @@ function vSettings(){
       for(const c of d.clients||[])await Store.put("clients",c);for(const j of d.jobs||[])await Store.put("jobs",j);S.clients=await Store.all("clients");S.jobs=await Store.all("jobs");
       if(d.settings){Object.assign(S.settings,d.settings);await saveSettingsLocal()}toast(`Restored ${(d.jobs||[]).length} jobs and ${(d.clients||[]).length} clients`);vSettings()}catch(err){toast("That file isn't an FFR Field Log backup")}};
   if($("m-clr"))$("m-clr").onclick=async()=>{for(const j of S.jobs.filter(j=>j.example))await Store.del("jobs",j.id);S.jobs=S.jobs.filter(j=>!j.example);
-    for(const c of S.clients.filter(c=>c.example&&!S.jobs.some(j=>j.clientId===c.id)))await Store.del("clients",c.id);S.clients=S.clients.filter(c=>!c.example||S.jobs.some(j=>j.clientId===c.id));toast("Examples removed");vSettings()};
+    for(const c of S.clients.filter(c=>c.example&&!S.jobs.some(j=>j.clientId===c.id)))await Store.del("clients",c.id);S.clients=S.clients.filter(c=>!c.example||S.jobs.some(j=>j.clientId===c.id));S.materials=S.materials.filter(m=>!m.example);await saveMaterialsLocal();toast("Examples removed");vSettings()};
 }
 
 /* ---------- start ---------- */
