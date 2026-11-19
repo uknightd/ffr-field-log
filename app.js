@@ -167,8 +167,12 @@ async function syncNow(){
     await Store.clear("clients");for(const c of S.clients)await Store.put("clients",c);
     if(st.data){Object.assign(S.settings,{company:st.data.company,prefix:st.data.prefix,nextNo:st.data.next_no,logo:st.data.logo,logoW:st.data.logo_w,logoH:st.data.logo_h});await saveSettingsLocal()}
     S.team=pr.data;await Store.put("meta",{key:"team",value:S.team});
+    await syncMaterials();
     const mt=await sb.from("materials").select("*").order("name");
-    if(!mt.error){S.materials=mt.data.map(m=>({id:m.id,name:m.name,unit:m.unit,price:+m.price,active:m.active})).filter(m=>m.active!==false);await saveMaterialsLocal()}
+    if(!mt.error){const local=S.materials.filter(m=>m.unsynced&&!mt.data.some(r=>r.id===m.id));
+      S.materials=mt.data.map(m=>({id:m.id,name:m.name,unit:m.unit,price:+m.price,active:m.active,needsPrice:!!m.needs_price,addedBy:(S.team.find(p=>p.id===m.added_by)||{}).full_name||""})).filter(m=>m.active!==false).concat(local);
+      await saveMaterialsLocal();
+      if(await applyPrices()){syncAgain=true}}
     const me=pr.data.find(p=>p.id===S.user.id);if(me){S.profile=me;await Store.put("meta",{key:"profile",value:me})}
     const byJob={};for(const p of ph.data)(byJob[p.job_id]=byJob[p.job_id]||[]).push(rowToPhoto(p));
     const local=new Map(S.jobs.map(j=>[j.id,j]));const seen=new Set();
@@ -297,6 +301,7 @@ function vJobs(){
   const mo=today().slice(0,7);const mj=S.jobs.filter(j=>j.date.startsWith(mo));
   const non=mj.filter(j=>j.type==="nonsla");
   view.innerHTML=`<h1>Jobs</h1><p class="lead">Every call-out, install and site visit, logged with photos and sign-off.</p>
+  ${isAdmin()&&needsPriceList().length?`<button class="callout" id="go-np" style="display:block;width:100%;text-align:left;margin-bottom:12px;border-top:0;border-right:0;border-bottom:0;color:var(--fg);font:inherit;cursor:pointer"><b>${needsPriceList().length} material${needsPriceList().length>1?"s need":" needs"} a price.</b> Technicians added ${needsPriceList().length>1?"them":"it"} on site. Tap to set prices.</button>`:""}
   ${S.sync.error&&navigator.onLine?`<div class="callout" style="margin-bottom:12px">Couldn't sync just now: ${esc(S.sync.error)}</div>`:""}
   <div class="stats"><div class="stat"><b>${mj.length}</b><span>Jobs this month</span></div><div class="stat non"><b>${non.length}</b><span>Non-SLA this month</span></div><div class="stat"><b>${non.filter(j=>!j.invoiced).length}</b><span>Not yet billed</span></div></div>
   <div class="toolbar"><input type="search" id="q" placeholder="Search job no, client, site…" value="${esc(f.q)}" aria-label="Search jobs">
@@ -309,6 +314,7 @@ function vJobs(){
   document.getElementById("fs").onchange=e=>{f.status=e.target.value;vJobs()};
   const fm=document.getElementById("fm");if(fm)fm.onchange=e=>{f.mine=e.target.checked;vJobs()};
   view.querySelectorAll(".job").forEach(el=>el.onclick=()=>go("job",el.dataset.id));
+  const np=document.getElementById("go-np");if(np)np.onclick=()=>go("materials");
 }
 function typePill(t){return t?`<span class="pill ${t}">${TYPES[t].short}</span>`:`<span class="pill draft">Type not set</span>`}
 function jobCard(j){const c=client(j.clientId);return`<button class="job" data-id="${j.id}" data-t="${j.type}"><span class="stripe"></span><span class="body">
@@ -388,21 +394,67 @@ function renderMats(){const j=S.editing;const box=document.getElementById("mats"
   const row=(m,i)=>`<div class="matrow"><input type="text" list="matlist" data-mi="${i}" data-k="item" value="${esc(m.item)}" placeholder="Material, e.g. CAT6 cable" aria-label="Material" autocomplete="off">
     <input type="text" inputmode="decimal" data-mi="${i}" data-k="qty" value="${esc(m.qty)}" placeholder="Qty" aria-label="Quantity">
     <button class="btn small ghost" data-rm="${i}" aria-label="Remove">✕</button>
-    <div class="matinfo" data-info="${i}">${matInfo(m)}</div></div>`;
+    <div class="matinfo" data-info="${i}">${matInfo(m,i)}</div></div>`;
   box.innerHTML=j.materials.length?j.materials.map(row).join("")+`<div class="mattot">Materials total <b data-mt>${R(matTotal(j))}</b></div>`:`<p class="note" style="margin:0">No materials added.</p>`;
-  box.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{const m=j.materials[+inp.dataset.mi];m[inp.dataset.k]=inp.value;
-    if(inp.dataset.k==="item"){const pm=matByName(inp.value);if(pm){m.materialId=pm.id;m.unit=pm.unit;m.price=pm.price}else{delete m.materialId;if(!isAdmin()){m.price=0;m.unit=""}}}
-    const info=box.querySelector(`[data-info="${inp.dataset.mi}"]`);if(info)info.innerHTML=matInfo(m);bindPrice();const t=box.querySelector("[data-mt]");if(t)t.textContent=R(matTotal(j));autosave()});
-  const bindPrice=()=>box.querySelectorAll("[data-price]").forEach(inp=>inp.oninput=()=>{const m=j.materials[+inp.dataset.price];m.price=parseFloat(inp.value.replace(",","."))||0;const lt=box.querySelector(`[data-lt="${inp.dataset.price}"]`);if(lt)lt.textContent=R(lineTotal(m));const t=box.querySelector("[data-mt]");if(t)t.textContent=R(matTotal(j));autosave()});
-  bindPrice();
+  const refresh=i=>{const info=box.querySelector(`[data-info="${i}"]`);if(info)info.innerHTML=matInfo(j.materials[i],i);bindInfo();const t=box.querySelector("[data-mt]");if(t)t.textContent=R(matTotal(j))};
+  box.querySelectorAll("input[data-mi]").forEach(inp=>{
+    inp.oninput=()=>{const i=+inp.dataset.mi,m=j.materials[i];m[inp.dataset.k]=inp.value;
+      if(inp.dataset.k==="item")linkMaterial(m);
+      refresh(i);autosave()};
+    if(inp.dataset.k==="item")inp.onchange=async()=>{const i=+inp.dataset.mi,m=j.materials[i];
+      if(m.item.trim()&&!m.materialId){await addMissingMaterial(m);refresh(i);autosave()}};
+  });
+  const bindInfo=()=>{
+    box.querySelectorAll("[data-price]").forEach(inp=>inp.onchange=async()=>{const i=+inp.dataset.price,m=j.materials[i];const pm=S.materials.find(x=>x.id===m.materialId);const v=parseFloat(inp.value.replace(",","."))||0;if(!pm||v<=0)return;
+      const old={...pm};pm.price=v;pm.needsPrice=false;if(!await saveMaterial(pm)){Object.assign(pm,old);refresh(i);return}await saveMaterialsLocal();await applyPrices();linkMaterial(m);refresh(i);autosave();toast(`${pm.name} added to the price list at ${R(v)}`)});
+    box.querySelectorAll("[data-unit]").forEach(sel=>sel.onchange=async()=>{const i=+sel.dataset.unit,m=j.materials[i];const pm=S.materials.find(x=>x.id===m.materialId);if(!pm)return;pm.unit=sel.value;m.unit=sel.value;await saveMaterialsLocal();if(pm.unsynced||isAdmin())syncMaterials();autosave()});
+  };
+  bindInfo();
   box.querySelectorAll("[data-rm]").forEach(b=>b.onclick=()=>{j.materials.splice(+b.dataset.rm,1);renderMats();autosave()});
 }
-function matInfo(m){
-  const i=S.editing.materials.indexOf(m);
-  if(!m.item)return"";
-  if(m.materialId)return`${esc(m.unit||"each")} @ ${R(m.price)} = <b data-lt="${i}">${R(lineTotal(m))}</b>`;
-  if(isAdmin())return`Not on the price list. Price each: <input type="text" inputmode="decimal" data-price="${i}" value="${m.price||""}" placeholder="0.00" aria-label="Price each" style="width:90px;min-height:32px;padding:4px 8px"> = <b data-lt="${i}">${R(lineTotal(m))}</b>`;
-  return`Not on the price list. The office will add the price.`;
+const UNITS=["each","m","box","roll","pack","hour","set"];
+function linkMaterial(m){const pm=matByName(m.item);
+  if(pm){m.materialId=pm.id;m.unit=pm.unit;if(pm.needsPrice){m.price=0;m.pending=true}else{m.price=pm.price;delete m.pending}}
+  else{delete m.materialId;delete m.pending;m.price=0;m.unit=""}}
+async function addMissingMaterial(m){
+  const name=m.item.trim();if(!name)return;
+  const pm={id:uuid(),name,unit:"each",price:0,needsPrice:true,unsynced:true,addedBy:myName()};
+  S.materials.push(pm);await saveMaterialsLocal();linkMaterial(m);
+  toast(`${name} added to the materials list. The office will set the price.`);
+  syncMaterials();
+}
+function matInfo(m,i){
+  if(!m||!m.item)return"";
+  const pm=m.materialId&&S.materials.find(x=>x.id===m.materialId);
+  if(pm&&pm.needsPrice){
+    const unitSel=`<select data-unit="${i}" aria-label="Unit" style="min-height:32px;padding:2px 6px;width:auto">${[...new Set([...UNITS,pm.unit])].map(u=>`<option ${u===pm.unit?"selected":""}>${esc(u)}</option>`).join("")}</select>`;
+    if(isAdmin())return`New material, no price yet. Unit ${unitSel} Price each: <input type="text" inputmode="decimal" data-price="${i}" placeholder="0.00" aria-label="Price each" style="width:90px;min-height:32px;padding:4px 8px">`;
+    return`<span class="pill nonsla" style="text-transform:none;letter-spacing:0">Waiting for office price</span> Unit ${unitSel}`;
+  }
+  if(m.materialId)return`${esc(m.unit||"each")} @ ${R(m.price)} = <b>${R(lineTotal(m))}</b>`;
+  return`Not on the price list yet. It will be added when you move to the next box.`;
+}
+/* fill in prices on job lines that were waiting for the office */
+async function applyPrices(){
+  let n=0;
+  for(const j of S.jobs){if(j.invoiced||!canEditJob(j))continue;let ch=false;
+    for(const m of j.materials){if(!m.pending||!m.materialId)continue;const pm=S.materials.find(x=>x.id===m.materialId);
+      if(pm&&!pm.needsPrice&&pm.price>0){m.price=pm.price;m.unit=pm.unit;delete m.pending;ch=true}}
+    if(ch){n++;j.dirty=true;await Store.put("jobs",j)}}
+  if(n)setNet();return n;
+}
+const pendingLines=j=>j.materials.filter(m=>m.item&&m.pending).length;
+const needsPriceList=()=>S.materials.filter(m=>m.needsPrice);
+let matSyncBusy=false;
+async function syncMaterials(){
+  if(!CLOUD||!S.user||!navigator.onLine||matSyncBusy)return;matSyncBusy=true;
+  try{for(const pm of S.materials.filter(x=>x.unsynced)){
+      const row=isAdmin()?{id:pm.id,name:pm.name,unit:pm.unit,price:pm.price,needs_price:!!pm.needsPrice}:{id:pm.id,name:pm.name,unit:pm.unit,price:0,needs_price:true};
+      const{error}=isAdmin()?await sb.from("materials").upsert(row):await sb.from("materials").insert(row);
+      if(error&&!/duplicate key/i.test(error.message)){console.warn("material",error.message);continue}
+      pm.unsynced=false;}
+    await saveMaterialsLocal();
+  }finally{matSyncBusy=false}
 }
 function renderPhotos(){const j=S.editing;const box=document.getElementById("photos");if(!box)return;
   box.innerHTML=j.photos.map((p,i)=>`<div class="ph">${photoImg(p,STAGES[p.stage]+" photo")}<div class="cap"><b>${STAGES[p.stage]}</b> · ${new Date(p.ts).toLocaleTimeString("en-ZA",{hour:"2-digit",minute:"2-digit"})}${p.lat?" · GPS":""}</div><button class="x" data-px="${i}" aria-label="Remove photo">×</button></div>`).join("")||`<p class="note" style="margin:0;grid-column:1/-1">No photos yet. Take a before photo when you arrive.</p>`;
@@ -471,7 +523,7 @@ function vJob(){
    <dt>Technician</dt><dd>${esc(j.techName||"—")}</dd>${j.type==="nonsla"?`<dt>Estimated charge</dt><dd>${R(jobAmount(j))} <span class="note">(call-out + ${jobHours(j)} h labour + materials, excl. VAT)</span></dd>`:""}
   </dl></section>
   ${j.type==="nonsla"?`<section class="section"><h2>Why this is not covered by the SLA</h2><div class="chips">${j.reasons.map(r=>`<span class="pill nonsla" style="text-transform:none;letter-spacing:0;font-size:13px">${esc(r)}</span>`).join("")}</div>${j.reasonNote?`<p style="margin:0">${esc(j.reasonNote)}</p>`:""}<p class="note" style="margin:0">${j.ack?"Client agreed on site that this work is chargeable.":"Client has not acknowledged the charge."}</p></section>`:""}
-  <section class="section"><h2>Work</h2><dl class="kv"><dt>Reported</dt><dd>${esc(j.fault||"—")}</dd><dt>Found</dt><dd>${esc(j.findings||"—")}</dd><dt>Done</dt><dd>${esc(j.work||"—")}</dd><dt>Materials</dt><dd>${j.materials.filter(m=>m.item).map(m=>esc((m.qty?m.qty+" × ":"")+m.item)+(m.price?` <span class="note">@ ${R(m.price)} = ${R(lineTotal(m))}</span>`:"")).join("<br>")||"—"}${matTotal(j)?`<br><b>Total ${R(matTotal(j))}</b>`:""}</dd></dl></section>
+  <section class="section"><h2>Work</h2><dl class="kv"><dt>Reported</dt><dd>${esc(j.fault||"—")}</dd><dt>Found</dt><dd>${esc(j.findings||"—")}</dd><dt>Done</dt><dd>${esc(j.work||"—")}</dd><dt>Materials</dt><dd>${j.materials.filter(m=>m.item).map(m=>esc((m.qty?m.qty+" × ":"")+m.item)+(m.pending?' <span class="pill nonsla" style="text-transform:none;letter-spacing:0">Price pending</span>':m.price?` <span class="note">@ ${R(m.price)} = ${R(lineTotal(m))}</span>`:"")).join("<br>")||"—"}${matTotal(j)?`<br><b>Total ${R(matTotal(j))}</b>`:""}</dd></dl></section>
   <section class="section"><h2>Photos (${j.photos.length})</h2><div class="photos">${j.photos.map(p=>`<div class="ph">${photoImg(p,STAGES[p.stage]+" photo")}<div class="cap"><b>${STAGES[p.stage]}</b> · ${new Date(p.ts).toLocaleString("en-ZA",{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"})}</div></div>`).join("")||'<p class="note" style="margin:0">No photos.</p>'}</div></section>
   <section class="section"><h2>Signatures</h2><div class="row"><div><div class="note">Technician: ${esc(j.techName||"—")}</div>${j.techSig?`<img src="${j.techSig}" alt="Technician signature" style="max-height:80px;background:#fff;border-radius:6px">`:'<p class="note">Not signed</p>'}</div><div><div class="note">Client: ${esc(j.clientName||"—")}</div>${j.clientSig?`<img src="${j.clientSig}" alt="Client signature" style="max-height:80px;background:#fff;border-radius:6px">`:'<p class="note">Not signed</p>'}</div></div></section>
   <div class="actions"><button class="btn primary" id="pdf">Download job report (PDF)</button>${canEditJob(j)?'<button class="btn" id="edit">Edit job</button>':""}</div>
@@ -514,7 +566,7 @@ async function jobPDF(j){
   if(mats.length){head("Materials used");const priced=j.type==="nonsla";doc.setFontSize(9.5);
     const hdr=()=>{doc.setFont("helvetica","bold");doc.setTextColor(...col.muted);doc.text("Item",M,y);doc.text("Qty",priced?W-M-68:W-M,y,{align:"right"});if(priced){doc.text("Unit price",W-M-30,y,{align:"right"});doc.text("Amount",W-M,y,{align:"right"})}y+=5;doc.setFont("helvetica","normal")};hdr();
     mats.forEach(m=>{const nm=doc.splitTextToSize(m.item,priced?W-2*M-80:W-2*M-30);ensure(nm.length*4.6+2);doc.setTextColor(...col.ink);doc.text(nm,M,y);doc.text(`${m.qty||""}${m.unit&&m.unit!=="each"?" "+m.unit:""}`,priced?W-M-68:W-M,y,{align:"right"});
-      if(priced){doc.text(m.price?R(m.price):"—",W-M-30,y,{align:"right"});doc.text(R(lineTotal(m)),W-M,y,{align:"right"})}y+=nm.length*4.6+0.8});
+      if(priced){doc.text(m.pending?"pending":m.price?R(m.price):"—",W-M-30,y,{align:"right"});doc.text(m.pending?"—":R(lineTotal(m)),W-M,y,{align:"right"})}y+=nm.length*4.6+0.8});
     if(priced){ensure(7);doc.setDrawColor(...col.line);doc.line(W-M-70,y-2.5,W-M,y-2.5);doc.setFont("helvetica","bold");doc.text("Materials total",W-M-30,y+1.5,{align:"right"});doc.text(R(matTotal(j)),W-M,y+1.5,{align:"right"});doc.setFont("helvetica","normal");y+=7}}
   if(j.type==="nonsla"){head("Charges (estimate)");kv([["Call-out fee",R(c.callout)],["Labour",`${jobHours(j)} h × ${R(c.rate)}/h = ${R(jobHours(j)*(+c.rate||0))}`],["Materials",R(matTotal(j))],["Total (excl. VAT)",R(jobAmount(j))]])}
   if(photos.length){head(`Photos (${photos.length})`);const gw=(W-2*M-6)/2;let cx=0,lastH=60;
@@ -538,7 +590,7 @@ function vBilling(){
   view.innerHTML=`<h1>Billing</h1><p class="lead">Non-SLA work to invoice. Amounts are call-out, labour at each client's rate and materials from the price list, before VAT.</p>
   <div class="toolbar"><label class="f" style="flex:0 1 200px">Month<input type="month" id="bm" value="${m}" style="width:100%;font:inherit;color:var(--fg);background:var(--surface2);border:1px solid var(--line);border-radius:8px;padding:10px 11px;min-height:44px"></label></div>
   <div class="stats"><div class="stat non"><b>${list.length}</b><span>Non-SLA jobs</span></div><div class="stat"><b>${open.length}</b><span>Not invoiced</span></div><div class="stat"><b style="font-size:17px">${R(tot)}</b><span>Est. value</span></div></div>
-  ${list.length?`<div class="section"><div class="tblwrap"><table class="bill"><thead><tr><th>Job</th><th>Client / cause</th><th class="n">Hours</th><th class="n">Est.</th><th>Billed</th></tr></thead><tbody>${list.map(j=>`<tr><td><a href="#" data-open="${j.id}" class="mono">${esc(isTempNo(j.no)?"New":j.no)}</a><br><span class="note">${fmtDate(j.date)}</span></td><td>${esc(client(j.clientId)?.name||"—")}<br><span class="note">${esc(j.reasons.join("; "))}</span></td><td class="n">${jobHours(j)}</td><td class="n">${R(jobAmount(j))}</td><td><input type="checkbox" data-inv="${j.id}" ${j.invoiced?"checked":""} ${isAdmin()?"":"disabled"} aria-label="Invoiced"></td></tr>`).join("")}</tbody></table></div></div>
+  ${list.length?`<div class="section"><div class="tblwrap"><table class="bill"><thead><tr><th>Job</th><th>Client / cause</th><th class="n">Hours</th><th class="n">Est.</th><th>Billed</th></tr></thead><tbody>${list.map(j=>`<tr><td><a href="#" data-open="${j.id}" class="mono">${esc(isTempNo(j.no)?"New":j.no)}</a><br><span class="note">${fmtDate(j.date)}</span></td><td>${esc(client(j.clientId)?.name||"—")}<br><span class="note">${esc(j.reasons.join("; "))}</span></td><td class="n">${jobHours(j)}</td><td class="n">${R(jobAmount(j))}${pendingLines(j)?'<br><span class="note" style="color:var(--non)">price pending</span>':""}</td><td><input type="checkbox" data-inv="${j.id}" ${j.invoiced?"checked":""} ${isAdmin()?"":"disabled"} aria-label="Invoiced"></td></tr>`).join("")}</tbody></table></div></div>
   <div class="actions" style="margin-top:12px"><button class="btn primary" id="bpdf">Download month summary (PDF)</button><button class="btn" id="bcsv">Download for spreadsheet (CSV)</button></div>`:`<div class="empty">No non-SLA jobs logged for this month.</div>`}`;
   document.getElementById("bm").onchange=e=>{S.billMonth=e.target.value||today().slice(0,7);vBilling()};
   view.querySelectorAll("[data-open]").forEach(a=>a.onclick=e=>{e.preventDefault();go("job",a.dataset.open)});
@@ -558,7 +610,7 @@ function vBilling(){
 /* ---------- clients ---------- */
 function vClients(){
   view.innerHTML=`<h1>Clients</h1><p class="lead">What each SLA covers, and the rates used for chargeable work.${isAdmin()?"":" Only the office can add or change clients."}</p>
-  <div class="actions" style="margin-bottom:12px">${isAdmin()?'<button class="btn primary" id="nc">+ Add client</button>':""}<button class="btn" id="go-mats">Materials price list (${S.materials.length})</button></div>
+  <div class="actions" style="margin-bottom:12px">${isAdmin()?'<button class="btn primary" id="nc">+ Add client</button>':""}<button class="btn" id="go-mats">Materials price list (${S.materials.length})${isAdmin()&&needsPriceList().length?` · ${needsPriceList().length} need a price`:""}</button></div>
   <div class="jobs">${S.clients.slice().sort((a,b)=>a.name.localeCompare(b.name)).map(c=>{const n=S.jobs.filter(j=>j.clientId===c.id).length;return`<button class="job" data-id="${c.id}" data-t="${/no sla/i.test(c.sla||"")||!c.sla?"maint":"sla"}"><span class="stripe"></span><span class="body"><span class="l1"><span class="client">${esc(c.name)}</span>${c.example?'<span class="pill ex">Example</span>':""}</span><span class="meta">${esc(c.sla||"No SLA on file")}</span><span class="meta">${n} job${n===1?"":"s"} · ${R(c.rate)}/h · call-out ${R(c.callout)}</span></span></button>`}).join("")||`<div class="empty">No clients yet.${isAdmin()?" Tap <b>Add client</b> to set up your first one.":""}</div>`}</div>`;
   const nc=document.getElementById("nc");if(nc)nc.onclick=()=>go("client","new");
   document.getElementById("go-mats").onclick=()=>go("materials");
@@ -592,8 +644,17 @@ function vClient(){
 /* ---------- materials price list ---------- */
 function vMaterials(){
   const ed=isAdmin();const list=S.materials.slice().sort((a,b)=>a.name.localeCompare(b.name));const q=(S.matQ||"").toLowerCase();
-  const shown=list.filter(m=>!q||m.name.toLowerCase().includes(q));
+  const shown=list.filter(m=>!m.needsPrice&&(!q||m.name.toLowerCase().includes(q)));
+  const need=list.filter(m=>m.needsPrice);
+  const usedOn=m=>S.jobs.filter(j=>j.materials.some(x=>x.materialId===m.id&&x.pending)).length;
   view.innerHTML=`<h1>Materials price list</h1><p class="lead">${ed?"Prices you set here fill in automatically when technicians add materials to a job. Changing a price doesn't change jobs already logged.":"Prices set by the office. Pick these when you add materials to a job."}</p>
+  ${need.length?`<section class="section needprice" style="margin-bottom:14px"><h2>Needs a price (${need.length})</h2>
+    <p class="note" style="margin:0">${ed?"Technicians added these on site. Set a price and it fills in on every job still waiting for it.":"Added by technicians. The office will set the prices."}</p>
+    <div class="mlist">${need.map(m=>`<div class="mrow" data-id="${m.id}">
+      <div class="mname"><b>${esc(m.name)}</b><div class="note">${m.addedBy?"Added by "+esc(m.addedBy)+" · ":""}${usedOn(m)} job${usedOn(m)===1?"":"s"} waiting${CLOUD&&m.unsynced?" · not sent yet":""}</div></div>
+      ${ed?`<label class="f">Unit<select data-f="unit">${[...new Set([...UNITS,m.unit])].map(u=>`<option ${u===m.unit?"selected":""}>${esc(u)}</option>`).join("")}</select></label>
+      <label class="f">Price (R)<input type="number" step="0.01" inputmode="decimal" data-setprice placeholder="0.00"></label>
+      <button class="btn small ghost" data-del="${m.id}" aria-label="Remove ${esc(m.name)}">✕</button>`:`<div class="note">${esc(m.unit)}</div>`}</div>`).join("")}</div></section>`:""}
   ${ed?`<form class="section" id="mf" style="margin-bottom:14px"><h2>Add material</h2>
     <label class="f">Material<input type="text" id="mf-name" placeholder="e.g. CAT6 cable" required></label>
     <div class="row"><label class="f">Unit<select id="mf-unit">${["each","m","box","roll","pack","hour","set"].map(u=>`<option>${u}</option>`).join("")}</select></label><label class="f">Price (R, excl. VAT)<input type="number" step="0.01" inputmode="decimal" id="mf-price" placeholder="0.00" required></label></div>
@@ -615,6 +676,9 @@ function vMaterials(){
   view.querySelectorAll(".mrow [data-f]").forEach(inp=>inp.onchange=async()=>{const m=S.materials.find(x=>x.id===inp.closest(".mrow").dataset.id);const old={...m};
     const f=inp.dataset.f;const v=f==="price"?(parseFloat(inp.value)||0):inp.value.trim();if(f==="name"&&!v){inp.value=m.name;return}
     m[f]=v;if(f==="name")m.example=false;if(!await saveMaterial(m)){Object.assign(m,old);vMaterials();return}await saveMaterialsLocal();toast("Saved")});
+  view.querySelectorAll("[data-setprice]").forEach(inp=>inp.onchange=async()=>{const m=S.materials.find(x=>x.id===inp.closest(".mrow").dataset.id);const v=parseFloat(inp.value)||0;if(v<=0)return;
+    const old={...m};m.price=v;m.needsPrice=false;if(!await saveMaterial(m)){Object.assign(m,old);vMaterials();return}m.unsynced=false;await saveMaterialsLocal();const n=await applyPrices();syncNow();
+    toast(`${m.name} priced at ${R(v)}${n?`, ${n} job${n>1?"s":""} updated`:""}`);vMaterials()});
   view.querySelectorAll("[data-del]").forEach(b=>b.onclick=async()=>{const m=S.materials.find(x=>x.id===b.dataset.del);
     if(!await confirmBox(`Remove ${m.name} from the price list? Jobs already logged keep their prices.`,"Remove"))return;
     if(CLOUD&&!m.example){if(needOnline())return;const{error}=await sb.from("materials").delete().eq("id",m.id);if(error){toast("Couldn't remove: "+error.message);return}}
@@ -622,7 +686,7 @@ function vMaterials(){
 }
 async function saveMaterial(m){
   if(!CLOUD)return true;if(needOnline())return false;
-  const{error}=await sb.from("materials").upsert({id:m.id,name:m.name,unit:m.unit,price:m.price,updated_at:new Date().toISOString()});
+  const{error}=await sb.from("materials").upsert({id:m.id,name:m.name,unit:m.unit,price:m.price,needs_price:!!m.needsPrice,updated_at:new Date().toISOString()});
   if(error){toast(/relation|does not exist|schema cache/i.test(error.message)?"The price list isn't switched on in the database yet. Try again shortly.":"Couldn't save: "+error.message);return false}
   return true;
 }
